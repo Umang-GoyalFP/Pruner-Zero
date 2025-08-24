@@ -9,8 +9,9 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset, load_from_disk
 from tqdm import tqdm
-from transformers import (AdamW, AutoModelForCausalLM, AutoTokenizer,
-                          LlamaTokenizer)
+from torch.optim import AdamW
+from transformers import (AutoModelForCausalLM, AutoTokenizer, get_scheduler)
+
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
