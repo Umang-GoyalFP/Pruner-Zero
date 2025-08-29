@@ -26,7 +26,18 @@ def get_llm(model_name, cache_dir="llm_weights"):
         device_map="auto"
     )
 
-    model.seqlen = model.config.max_position_embeddings 
+    # Fix sequence length handling for tiny models
+    if hasattr(model.config, 'max_position_embeddings'):
+        model.seqlen = model.config.max_position_embeddings
+    else:
+        # Fallback for models without max_position_embeddings
+        model.seqlen = getattr(model.config, 'n_positions', 2048)
+    
+    # Ensure seqlen is reasonable for tiny models
+    if model.seqlen > 4096:  # If it's too large, cap it
+        model.seqlen = 2048
+        
+    print(f"Model sequence length set to: {model.seqlen}")
     return model
 
 def main():
@@ -50,6 +61,10 @@ def main():
     parser.add_argument("--gradient_path", type=str, default=None, help="Path to save the gradient.")
     parser.add_argument("--json_tree", type=str, default="data/best_tree.json", help="Path to load the json tree.")
     parser.add_argument("--eval_zero_shot", action="store_true")
+    
+    # Add sequence length argument
+    parser.add_argument("--seqlen", type=int, default=2048, help="Sequence length for calibration")
+    
     args = parser.parse_args()
 
     # Setting seeds for reproducibility
@@ -66,13 +81,21 @@ def main():
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.eval()
+    
+    # Set up tokenizer with proper padding
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Adjust sequence length based on model capabilities
+    if hasattr(model, 'seqlen'):
+        args.seqlen = min(args.seqlen, model.seqlen)
+    print(f"Using sequence length: {args.seqlen}")
 
     device = torch.device("cuda:0")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model or "33b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
-
 
     start_time = time.time()
     if args.sparsity_ratio != 0:
@@ -90,7 +113,6 @@ def main():
     end_time = time.time()
     print("pruning time: ", end_time - start_time)
 
-
     ################################################################
     print("*"*30)
     sparsity_ratio = check_sparsity(model)
@@ -100,12 +122,14 @@ def main():
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
 
-    if not os.path.exists(args.save):
+    if args.save and not os.path.exists(args.save):
         os.makedirs(args.save)
-    save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
-    with open(save_filepath, "a+") as f:
-        print("method\tactual_sparsity\tppl_test\tnum_samples", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}\t{args.nsamples}", file=f, flush=True)
+    
+    if args.save:
+        save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
+        with open(save_filepath, "a+") as f:
+            print("method\tactual_sparsity\tppl_test\tnum_samples", file=f, flush=True)
+            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}\t{args.nsamples}", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False
@@ -120,12 +144,12 @@ def main():
         print(results)
 
         # save all results, which is a json object
-        save_filepath = os.path.join(args.save, f"log_lm_eval_{args.prune_method}.json")
-        results_json = json.dumps(results, indent=4)
-        with open(save_filepath, "a+") as file: 
-            file.write(results_json)
-        print(f"Results saved to {save_filepath}")
-            
+        if args.save:
+            save_filepath = os.path.join(args.save, f"log_lm_eval_{args.prune_method}.json")
+            results_json = json.dumps(results, indent=4)
+            with open(save_filepath, "a+") as file: 
+                file.write(results_json)
+            print(f"Results saved to {save_filepath}")
 
     if args.save_model:
         model.save_pretrained(args.save_model)
