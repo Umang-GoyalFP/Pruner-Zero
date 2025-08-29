@@ -1,5 +1,4 @@
 # Code adapted from https://github.com/IST-DASLab/sparsegpt/blob/master/datautils.py
-
 import numpy as np
 import random
 import torch
@@ -18,15 +17,13 @@ class TokenizerWrapper:
 # Load and process wikitext2 dataset
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     # Load train and test datasets
-    # traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    # testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-    traindata = load_from_disk('./data/wikitext2_train')
-    testdata = load_from_disk('./data/wikitext2_test')
-
+    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    
     # Encode datasets
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
-
+    
     # Generate samples from training set
     random.seed(seed)
     trainloader = []
@@ -37,17 +34,15 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
+    
     return trainloader, testenc
 
-# Load and process c4 dataset
+# Load and process c4 dataset using HuggingFace
 def get_c4(nsamples, seed, seqlen, tokenizer):
-    # Load train and validation datasets
-    # traindata = load_dataset('allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
-    # valdata = load_dataset('allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
+    # Load validation split (smaller than train)
+    traindata = load_dataset("allenai/c4", "en", split="validation")
+    valdata = load_dataset("allenai/c4", "en", split="validation")
     
-    traindata = load_from_disk('~/workspace/pruner-zero-private/data/c4_train')
-    valdata = load_from_disk('~/workspace/pruner-zero-private/data/c4_valid')
-
     # Generate samples from training set
     random.seed(seed)
     trainloader = []
@@ -63,7 +58,7 @@ def get_c4(nsamples, seed, seqlen, tokenizer):
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
-
+    
     # Prepare validation dataset
     valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
     valenc = valenc.input_ids[:, :(256 * seqlen)]
