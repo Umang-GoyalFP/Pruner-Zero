@@ -61,12 +61,11 @@ def prepare_calibration_input(model, dataloader, device):
     model.config.use_cache = False
     layers = model.model.layers
 
-    # dev = model.hf_device_map["model.embed_tokens"]
     if "model.embed_tokens" in model.hf_device_map:
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device) # ori: 128
+    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
@@ -79,12 +78,6 @@ def prepare_calibration_input(model, dataloader, device):
             cache['i'] += 1
             cache['attention_mask'] = kwargs.get('attention_mask', None)
             cache['position_ids'] = kwargs.get('position_ids', None)
-            
-            # CRITICAL FIX: Generate position_ids if None
-            if cache['position_ids'] is None:
-                seq_len = inp.shape[1]
-                cache['position_ids'] = torch.arange(seq_len, device=inp.device, dtype=torch.long).unsqueeze(0)
-                
             raise ValueError
             
     layers[0] = Catcher(layers[0])
@@ -99,13 +92,7 @@ def prepare_calibration_input(model, dataloader, device):
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
     
-    # ADDITIONAL FIX: Ensure position_ids are not None
-    if position_ids is None:
-        print("Warning: position_ids still None, generating default ones")
-        position_ids = torch.arange(model.seqlen, device=device, dtype=torch.long).unsqueeze(0)
-    
     model.config.use_cache = use_cache
-
     return inps, outs, attention_mask, position_ids 
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
@@ -138,39 +125,6 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def _safe_layer_call(layer, inp, attention_mask, position_ids, device):
-    """
-    Helper function to safely call layer with proper position_ids and attention_mask handling
-    """
-    current_seq_len = inp.shape[1]  # inp is already unsqueezed, so shape[1] is seq_len
-    
-    # Handle position_ids
-    if position_ids is not None:
-        if position_ids.shape[1] >= current_seq_len:
-            batch_position_ids = position_ids[:, :current_seq_len]
-        else:
-            # Generate new position_ids if cached ones are too short
-            batch_position_ids = torch.arange(current_seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    else:
-        batch_position_ids = torch.arange(current_seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    
-    # Handle attention_mask
-    if attention_mask is not None:
-        if attention_mask.shape[1] >= current_seq_len:
-            batch_attention_mask = attention_mask[:, :current_seq_len]
-        else:
-            # Generate new attention_mask if cached one is too short
-            batch_attention_mask = torch.ones(1, current_seq_len, device=device, dtype=attention_mask.dtype)
-    else:
-        batch_attention_mask = None
-    
-    return layer(
-        inp, 
-        attention_mask=batch_attention_mask, 
-        position_ids=batch_position_ids,
-        use_cache=False
-    )[0]
-
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
@@ -186,7 +140,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps, outs = inps.to(dev), outs.to(dev)
             if attention_mask is not None:
@@ -209,10 +163,19 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                inp = inps[j].unsqueeze(0)
+                # Generate position_ids if None to avoid rotary embedding errors
+                if position_ids is None:
+                    batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+                else:
+                    batch_position_ids = position_ids
+                
+                if attention_mask is not None:
+                    outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+                else:
+                    outs[j] = layer(inp, position_ids=batch_position_ids)[0]
                 
         for h in handles:
             h.remove()
@@ -221,9 +184,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             print(f"pruning layer {i} name {name}")
             W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            W_mask = (torch.zeros_like(W_metric) == 1)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
@@ -232,7 +194,6 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
                 if args.use_variant:
-                    # wanda variant 
                     tmp_metric = torch.cumsum(sort_res[0], dim=1)
                     sum_before = W_metric.sum(dim=1)
 
@@ -251,16 +212,24 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                 else:
-                    # unstructured pruning
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data[W_mask] = 0
 
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                inp = inps[j].unsqueeze(0)
+                # Generate position_ids if None to avoid rotary embedding errors
+                if position_ids is None:
+                    batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+                else:
+                    batch_position_ids = position_ids
+                
+                if attention_mask is not None:
+                    outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+                else:
+                    outs[j] = layer(inp, position_ids=batch_position_ids)[0]
                 
         inps, outs = outs, inps
 
@@ -270,7 +239,6 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
-    ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
     dataloader, _ = get_loaders("wikitext2",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
 
@@ -296,12 +264,6 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             cache['i'] += 1
             cache['attention_mask'] = kwargs.get('attention_mask', None)
             cache['position_ids'] = kwargs.get('position_ids', None)
-            
-            # CRITICAL FIX: Generate position_ids if None
-            if cache['position_ids'] is None:
-                seq_len = inp.shape[1]
-                cache['position_ids'] = torch.arange(seq_len, device=inp.device, dtype=torch.long).unsqueeze(0)
-            
             raise ValueError
             
     layers[0] = Catcher(layers[0])
@@ -316,11 +278,6 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
-    
-    # ADDITIONAL FIX: Ensure position_ids are not None
-    if position_ids is None:
-        print("Warning: position_ids still None, generating default ones")
-        position_ids = torch.arange(model.seqlen, device=dev, dtype=torch.long).unsqueeze(0)
 
     print('Ready.')
 
@@ -350,9 +307,18 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
-            outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+            inp = inps[j].unsqueeze(0)
+            # Generate position_ids if None to avoid rotary embedding errors
+            if position_ids is None:
+                batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+            else:
+                batch_position_ids = position_ids
+            
+            if attention_mask is not None:
+                outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+            else:
+                outs[j] = layer(inp, position_ids=batch_position_ids)[0]
             
         for h in handles:
             h.remove()
@@ -364,9 +330,18 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
             gpts[name].free()
 
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
-            outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+            inp = inps[j].unsqueeze(0)
+            # Generate position_ids if None to avoid rotary embedding errors
+            if position_ids is None:
+                batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+            else:
+                batch_position_ids = position_ids
+            
+            if attention_mask is not None:
+                outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+            else:
+                outs[j] = layer(inp, position_ids=batch_position_ids)[0]
 
         layers[i] = layer 
         torch.cuda.empty_cache()
@@ -396,7 +371,7 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps, outs = inps.to(dev), outs.to(dev)
             if attention_mask is not None:
@@ -419,10 +394,19 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
             
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                inp = inps[j].unsqueeze(0)
+                # Generate position_ids if None to avoid rotary embedding errors
+                if position_ids is None:
+                    batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+                else:
+                    batch_position_ids = position_ids
+                
+                if attention_mask is not None:
+                    outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+                else:
+                    outs[j] = layer(inp, position_ids=batch_position_ids)[0]
                 
         for h in handles:
             h.remove()
@@ -441,9 +425,8 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
             )
             assert W_metric is not None
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            W_mask = (torch.zeros_like(W_metric) == 1)
             if prune_n != 0:
-                # structured n:m sparsity
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
@@ -452,7 +435,6 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
                 if args.use_variant:
-                    # wanda variant 
                     tmp_metric = torch.cumsum(sort_res[0], dim=1)
                     sum_before = W_metric.sum(dim=1)
 
@@ -471,16 +453,24 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                 else:
-                    # unstructured pruning
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data[W_mask] = 0
 
-        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                inp = inps[j].unsqueeze(0)
+                # Generate position_ids if None to avoid rotary embedding errors
+                if position_ids is None:
+                    batch_position_ids = torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0)
+                else:
+                    batch_position_ids = position_ids
+                
+                if attention_mask is not None:
+                    outs[j] = layer(inp, attention_mask=attention_mask, position_ids=batch_position_ids)[0]
+                else:
+                    outs[j] = layer(inp, position_ids=batch_position_ids)[0]
                 
         inps, outs = outs, inps
 
