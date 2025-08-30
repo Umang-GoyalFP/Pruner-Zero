@@ -77,9 +77,16 @@ def prepare_calibration_input(model, dataloader, device):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask', None)
+            cache['position_ids'] = kwargs.get('position_ids', None)
+            
+            # CRITICAL FIX: Generate position_ids if None
+            if cache['position_ids'] is None:
+                seq_len = inp.shape[1]
+                cache['position_ids'] = torch.arange(seq_len, device=inp.device, dtype=torch.long).unsqueeze(0)
+                
             raise ValueError
+            
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -91,6 +98,12 @@ def prepare_calibration_input(model, dataloader, device):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    
+    # ADDITIONAL FIX: Ensure position_ids are not None
+    if position_ids is None:
+        print("Warning: position_ids still None, generating default ones")
+        position_ids = torch.arange(model.seqlen, device=device, dtype=torch.long).unsqueeze(0)
+    
     model.config.use_cache = use_cache
 
     return inps, outs, attention_mask, position_ids 
@@ -125,6 +138,38 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
+def _safe_layer_call(layer, inp, attention_mask, position_ids, device):
+    """
+    Helper function to safely call layer with proper position_ids and attention_mask handling
+    """
+    current_seq_len = inp.shape[1]  # inp is already unsqueezed, so shape[1] is seq_len
+    
+    # Handle position_ids
+    if position_ids is not None:
+        if position_ids.shape[1] >= current_seq_len:
+            batch_position_ids = position_ids[:, :current_seq_len]
+        else:
+            # Generate new position_ids if cached ones are too short
+            batch_position_ids = torch.arange(current_seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    else:
+        batch_position_ids = torch.arange(current_seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    
+    # Handle attention_mask
+    if attention_mask is not None:
+        if attention_mask.shape[1] >= current_seq_len:
+            batch_attention_mask = attention_mask[:, :current_seq_len]
+        else:
+            # Generate new attention_mask if cached one is too short
+            batch_attention_mask = torch.ones(1, current_seq_len, device=device, dtype=attention_mask.dtype)
+    else:
+        batch_attention_mask = None
+    
+    return layer(
+        inp, 
+        attention_mask=batch_attention_mask, 
+        position_ids=batch_position_ids,
+        use_cache=False
+    )[0]
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
@@ -148,6 +193,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 attention_mask = attention_mask.to(dev)
             if position_ids is not None:
                 position_ids = position_ids.to(dev)
+        else:
+            dev = device
 
         wrapped_layers = {}
         for name in subset:
@@ -161,9 +208,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                
         for h in handles:
             h.remove()
 
@@ -207,9 +257,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
             subset[name].weight.data[W_mask] = 0  ## set weights to zero 
 
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -242,9 +294,16 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask', None)
+            cache['position_ids'] = kwargs.get('position_ids', None)
+            
+            # CRITICAL FIX: Generate position_ids if None
+            if cache['position_ids'] is None:
+                seq_len = inp.shape[1]
+                cache['position_ids'] = torch.arange(seq_len, device=inp.device, dtype=torch.long).unsqueeze(0)
+            
             raise ValueError
+            
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -257,6 +316,11 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    
+    # ADDITIONAL FIX: Ensure position_ids are not None
+    if position_ids is None:
+        print("Warning: position_ids still None, generating default ones")
+        position_ids = torch.arange(model.seqlen, device=dev, dtype=torch.long).unsqueeze(0)
 
     print('Ready.')
 
@@ -286,8 +350,10 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+            
         for h in handles:
             h.remove()
 
@@ -298,8 +364,9 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
             gpts[name].free()
 
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
 
         layers[i] = layer 
         torch.cuda.empty_cache()
@@ -310,9 +377,6 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     torch.cuda.empty_cache()
 
 
-
-
-    
 def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, engine=None):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
@@ -339,6 +403,8 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
                 attention_mask = attention_mask.to(dev)
             if position_ids is not None:
                 position_ids = position_ids.to(dev)
+        else:
+            dev = device
 
         wrapped_layers = {}
         for name in subset:
@@ -352,9 +418,12 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+            
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                
         for h in handles:
             h.remove()
 
@@ -408,11 +477,12 @@ def prune_pruner_zero(args, model, tokenizer, device=torch.device("cuda:0"), pru
 
             subset[name].weight.data[W_mask] = 0  ## set weights to zero 
 
+        # FIXED: Use safe layer call
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _safe_layer_call(layer, inps[j].unsqueeze(0), attention_mask, position_ids, dev)
+                
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
-
